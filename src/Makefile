@@ -16,7 +16,8 @@ RUNNING_VERSION_CODE=$(shell echo $$(( $(VER_MAJOR) * 65536 + $(VER_MINOR) * 256
 
 _LIBC ?= glibc
 
-APPS = cachestat \
+APPS = bugs_memleak \
+       cachestat \
        dc \
        disk \
        fd \
@@ -62,3 +63,4 @@ clean:
 	cd $(LIBBPF)/src/ && make clean
 	cd $(OUTPUT) && find . -type f ! -name '*.sh' ! -name '.git*'  -delete
 	rm -f *.o 
+	rm -f *.log 
