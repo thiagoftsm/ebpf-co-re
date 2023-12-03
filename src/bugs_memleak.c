@@ -167,6 +167,8 @@ static int ebpf_bugs_tests()
         return -1;
     }
 
+    skel->rodata->monitor_pid = vars.pid;
+
     if (bugs_memleak_bpf__load(skel)) {
         fprintf(stderr, "Fail to load bpf program.\n");
         return -1;

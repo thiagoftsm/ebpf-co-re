@@ -5,6 +5,8 @@
 #include "netdata_core.h"
 #include "bugs.h"
 
+const volatile size_t monitor_pid = 0;
+
 /************************************************************************************
  *
  *                                 MAPS
