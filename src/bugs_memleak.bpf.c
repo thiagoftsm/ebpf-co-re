@@ -148,7 +148,7 @@ static __always_inline int ebpf_alloc_enter(size_t size)
     return 0;
 }
 
-static __always_inline void ebpf_overflow_entry()
+static __always_inline void ebpf_overflow_entry(int safe)
 {
     ebpf_mem_stat_t *fill;
     ebpf_mem_stat_t data = {};
@@ -159,9 +159,18 @@ static __always_inline void ebpf_overflow_entry()
 
     if (fill) {
         libnetdata_update_u64(&fill->str_copy_entry, 1);
+        if (safe)
+            libnetdata_update_u32(&fill->safe_function, 1);
+        else
+            libnetdata_update_u32(&fill->unsafe_function, 1);
     } else {
         data.tgid = tgid;
         data.str_copy_entry = 1;
+        if (safe)
+            data.safe_function = 1;
+        else
+            data.unsafe_function = 1;
+
         libnetdata_update_uid_gid(&data.uid, &data.gid);
         bpf_get_current_comm(&data.name, TASK_COMM_LEN);
 
@@ -180,7 +189,7 @@ static __always_inline int ebpf_probe_signal(int sig)
 
     if (fill) {
         libnetdata_update_s64(&fill->signal, -fill->signal);
-        libnetdata_update_s64(&fill->signal, -fill->signal);
+        libnetdata_update_s64(&fill->signal, sig);
     } else {
         data.tgid = tgid;
         data.signal = 1;
@@ -355,16 +364,17 @@ int BPF_URETPROBE(pvalloc_exit)
 // https://linuxppc-dev.ozlabs.narkive.com/RG52tkkd/patchv2-net-1-3-samples-bpf-fix-build-breakage-with-map-perf-test-user-c
 // Instruction pointer
 
-// U(RET)PROBE are like K(RET)PROBE 
-SEC("uprobe/snprintf")
-int BPF_UPROBE(snprintf_enter)
-{
     /*
     __u64 val = PT_REGS_IP(ctx);
     __u32 tid = bpf_get_current_pid_tgid();
     bpf_map_update_elem(&bugs_overflow, &tid, &val, BPF_ANY);
     */
-    ebpf_overflow_entry();
+
+// U(RET)PROBE are like K(RET)PROBE 
+SEC("uprobe/snprintf")
+int BPF_UPROBE(snprintf_enter)
+{
+    ebpf_overflow_entry(1);
 
     return 0;
 }
@@ -372,12 +382,7 @@ int BPF_UPROBE(snprintf_enter)
 SEC("uprobe/sprintf")
 int BPF_UPROBE(sprintf_enter)
 {
-    /*
-    __u64 val = PT_REGS_IP(ctx);
-    __u32 tid = bpf_get_current_pid_tgid();
-    bpf_map_update_elem(&bugs_overflow, &tid, &val, BPF_ANY);
-    */
-    ebpf_overflow_entry();
+    ebpf_overflow_entry(0);
 
     return 0;
 }
@@ -385,12 +390,7 @@ int BPF_UPROBE(sprintf_enter)
 SEC("uprobe/vfprintf")
 int BPF_UPROBE(vfprintf_enter)
 {
-    /*
-    __u64 val = PT_REGS_IP(ctx);
-    __u32 tid = bpf_get_current_pid_tgid();
-    bpf_map_update_elem(&bugs_overflow, &tid, &val, BPF_ANY);
-    */
-    ebpf_overflow_entry();
+    ebpf_overflow_entry(0);
 
     return 0;
 }
@@ -399,12 +399,23 @@ int BPF_UPROBE(vfprintf_enter)
 SEC("uprobe/memcpy")
 int BPF_UPROBE(memcpy_enter)
 {
-    /*
-    __u64 val = PT_REGS_IP(ctx);
-    __u32 tid = bpf_get_current_pid_tgid();
-    bpf_map_update_elem(&bugs_overflow, &tid, &val, BPF_ANY);
-    */
-    ebpf_overflow_entry();
+    ebpf_overflow_entry(1);
+
+    return 0;
+}
+
+SEC("uprobe/gets")
+int BPF_UPROBE(gets_enter)
+{
+    ebpf_overflow_entry(0);
+
+    return 0;
+}
+
+SEC("uprobe/fgetc")
+int BPF_UPROBE(fgetc_enter)
+{
+    ebpf_overflow_entry(0);
 
     return 0;
 }

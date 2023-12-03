@@ -127,6 +127,10 @@ int ebpf_attach_leak_uprobes(struct bugs_memleak_bpf *skel)
     ATTACH_UPROBE_CHECKED(skel, vars.object, memcpy, memcpy_enter);
 //    ATTACH_UPROBE_CHECKED(skel, vars.object, memcpy, memcpy_exit);
 
+    ATTACH_UPROBE_CHECKED(skel, vars.object, gets, gets_enter);
+
+    ATTACH_UPROBE_CHECKED(skel, vars.object, fgetc, fgetc_enter);
+
     /*
     ATTACH_UPROBE_CHECKED(skel, vars.object, strcpy, strcpy_enter);
     ATTACH_UPROBE_CHECKED(skel, vars.object, strcpy, strcpy_exit);

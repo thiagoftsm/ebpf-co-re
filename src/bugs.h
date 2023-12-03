@@ -12,6 +12,8 @@ typedef struct ebpf_mem_stat {
     __u64 str_copy_entry;
 
     __u32 oom;
+    __u32 safe_function;
+    __u32 unsafe_function;
     __s64 signal;
 
     __u32 alloc;
