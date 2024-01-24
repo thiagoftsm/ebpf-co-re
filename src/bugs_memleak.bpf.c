@@ -5,7 +5,7 @@
 #include "netdata_core.h"
 #include "bugs.h"
 
-const volatile size_t monitor_pid = 0;
+//const volatile size_t monitor_pid = 0;
 
 /************************************************************************************
  *
@@ -49,13 +49,7 @@ struct {
     __uint(max_entries, 10240);
 } bugs_memptrs SEC(".maps");
 
-// Overflow
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, __u32);
-    __type(value, __u32);
-    __uint(max_entries, 10240);
-} bugs_overflow SEC(".maps");
+// ------------
 
 /************************************************************************************
  *
@@ -428,6 +422,13 @@ int BPF_UPROBE(fgetc_enter)
  *
  ***********************************************************************************/
 
+SEC("tp_btf/sched_switch")
+int BPF_PROG(netdata_sched_switch, bool preempt, struct task_struct *prev, struct task_struct *next)
+{
+    return ebpf_probe_signal(prev->exit_signal);
+}
+
+/*
 SEC("tracepoint/syscalls/sys_enter_kill")
 int kill_entry(struct trace_event_raw_sys_enter *ctx)
 {
@@ -454,6 +455,7 @@ int tgkill_entry(struct trace_event_raw_sys_enter *ctx)
 
     return ebpf_probe_signal(sig);
 }
+*/
 
 
 // ----------------- REMOVE ME after demo
