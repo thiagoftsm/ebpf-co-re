@@ -4,10 +4,20 @@ package main
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "netdata_core_loader.h"
+#ifndef TASK_COMM_LEN
+#define TASK_COMM_LEN 16
+#endif
+
+static void netdata_disable_libbpf_memlock_rlim(void)
+{
+	libbpf_set_memlock_rlim(0);
+}
+
 // BPF_MAP_TYPE_RINGBUF requires kernel >= 5.8 (version code 329728).
 #if MY_LINUX_VERSION_CODE >= 329728
 #include "cachestat_buffer.skel.h"
@@ -99,6 +109,81 @@ static const struct netdata_core_buffer_skel_ops *netdata_core_find_buffer_skel_
 
 	return NULL;
 }
+
+// BPF_MAP_TYPE_ARENA requires kernel >= 6.9 (version code 395520).
+#if MY_LINUX_VERSION_CODE >= 395520
+#include "netdata_cachestat_arena.h"
+#include "netdata_dc_arena.h"
+#include "netdata_dns_arena.h"
+#include "netdata_fd_arena.h"
+#include "netdata_oomkill_arena.h"
+#include "netdata_process_arena.h"
+#include "netdata_shm_arena.h"
+#include "netdata_swap_arena.h"
+#include "netdata_vfs_arena.h"
+
+#include "cachestat_arena.skel.h"
+#include "dc_arena.skel.h"
+#include "dns_arena.skel.h"
+#include "fd_arena.skel.h"
+#include "oomkill_arena.skel.h"
+#include "process_arena.skel.h"
+#include "shm_arena.skel.h"
+#include "swap_arena.skel.h"
+#include "vfs_arena.skel.h"
+
+// cgo and some compilers are more conservative about inline skeleton helpers.
+#define DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(prefix) \
+	struct prefix##_bpf; \
+	static struct prefix##_bpf *prefix##_bpf__open(void); \
+	static int prefix##_bpf__load(struct prefix##_bpf *obj); \
+	static void prefix##_bpf__destroy(struct prefix##_bpf *obj)
+
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(cachestat_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(dc_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(dns_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(fd_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(oomkill_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(process_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(shm_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(swap_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(vfs_arena);
+#undef DECLARE_NETDATA_CORE_ARENA_SKEL_OPS
+
+DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(cachestat_arena)
+DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(dc_arena)
+DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(dns_arena)
+DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(fd_arena)
+DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(oomkill_arena)
+DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(process_arena)
+DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(shm_arena)
+DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(swap_arena)
+DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(vfs_arena)
+
+static const struct netdata_core_buffer_skel_ops netdata_core_arena_skel_ops[] = {
+	{ "cachestat", netdata_core_open_cachestat_arena, netdata_core_load_cachestat_arena, netdata_core_destroy_cachestat_arena },
+	{ "dc", netdata_core_open_dc_arena, netdata_core_load_dc_arena, netdata_core_destroy_dc_arena },
+	{ "dns", netdata_core_open_dns_arena, netdata_core_load_dns_arena, netdata_core_destroy_dns_arena },
+	{ "fd", netdata_core_open_fd_arena, netdata_core_load_fd_arena, netdata_core_destroy_fd_arena },
+	{ "oomkill", netdata_core_open_oomkill_arena, netdata_core_load_oomkill_arena, netdata_core_destroy_oomkill_arena },
+	{ "process", netdata_core_open_process_arena, netdata_core_load_process_arena, netdata_core_destroy_process_arena },
+	{ "shm", netdata_core_open_shm_arena, netdata_core_load_shm_arena, netdata_core_destroy_shm_arena },
+	{ "swap", netdata_core_open_swap_arena, netdata_core_load_swap_arena, netdata_core_destroy_swap_arena },
+	{ "vfs", netdata_core_open_vfs_arena, netdata_core_load_vfs_arena, netdata_core_destroy_vfs_arena },
+};
+
+static const struct netdata_core_buffer_skel_ops *netdata_core_find_arena_skel_ops(const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(netdata_core_arena_skel_ops) / sizeof(netdata_core_arena_skel_ops[0]); i++) {
+		if (!strcmp(netdata_core_arena_skel_ops[i].name, name))
+			return &netdata_core_arena_skel_ops[i];
+	}
+
+	return NULL;
+}
+#endif // MY_LINUX_VERSION_CODE >= 395520
 
 static void netdata_core_fill_ctrl_map(struct bpf_object *obj, const char *ctrl_name, int map_level)
 {
@@ -262,6 +347,80 @@ static int netdata_core_test_ringbuf_map(struct bpf_map *map, int iterations,
 	return op_err;
 }
 
+#if MY_LINUX_VERSION_CODE >= 395520
+static int netdata_core_test_arena_map(struct bpf_map *map, int iterations,
+				       char *map_json_buf, int map_json_size)
+{
+	int fd = bpf_map__fd(map);
+	unsigned int key_size = (unsigned int)bpf_map__key_size(map);
+	unsigned int value_size = (unsigned int)bpf_map__value_size(map);
+	size_t arena_sz = (size_t)bpf_map__max_entries(map) * (size_t)sysconf(_SC_PAGE_SIZE);
+	size_t data_sz = 0;
+	// arena is already mmap'd by libbpf at load time; MAP_FIXED + map_extra required
+	void *arena_mem = bpf_map__initial_value(map, &data_sz);
+	int setup_err = arena_mem ? 0 : -EINVAL;
+	unsigned int prev_head = 0;
+	int pos = 0;
+	int n, i;
+
+	if (iterations < 1)
+		iterations = 1;
+
+	n = snprintf(map_json_buf + pos, (size_t)(map_json_size - pos),
+		"{\n"
+		"            \"Info\" : { \"Length\" : { \"Key\" : %u, \"Value\" : %u},\n"
+		"                       \"Type\" : %d,\n"
+		"                       \"FD\" : %d,\n"
+		"                       \"Data\" : [\n",
+		key_size, value_size, BPF_MAP_TYPE_ARENA, fd);
+	if (n > 0) pos += n;
+
+	if (arena_mem)
+		prev_head = *(volatile unsigned int *)arena_mem;
+
+	for (i = 0; i < iterations; i++) {
+		unsigned int cur_head = 0;
+		unsigned int delta = 0;
+
+		sleep(10);
+
+		if (arena_mem) {
+			cur_head = *(volatile unsigned int *)arena_mem;
+			delta = cur_head - prev_head;
+			prev_head = cur_head;
+		}
+
+		if (pos < map_json_size - 1) {
+			if (i > 0) {
+				n = snprintf(map_json_buf + pos, (size_t)(map_json_size - pos), ",\n");
+				if (n > 0) pos += n;
+			}
+			n = snprintf(map_json_buf + pos, (size_t)(map_json_size - pos),
+				"                                    "
+				"{ \"Iteration\" : %d, \"Mode\" : \"arena_consumer\", \"Setup\" : %d, "
+				"\"Operation Result\" : %u, \"Samples\" : %u, \"Bytes\" : 0, "
+				"\"Available\" : 0, \"Ring Size\" : %zu, \"Error Code\" : %d, "
+				"\"Error Message\" : \"%s\" }",
+				i, !setup_err, delta, delta, arena_sz,
+				setup_err, setup_err ? strerror(-setup_err) : "No error information");
+			if (n > 0) pos += n;
+		}
+	}
+
+	if (pos < map_json_size - 1) {
+		n = snprintf(map_json_buf + pos, (size_t)(map_json_size - pos),
+			"\n                                ]\n"
+			"                      }\n"
+			"        }");
+		if (n > 0) pos += n;
+	}
+	if (pos < map_json_size)
+		map_json_buf[pos] = '\0';
+
+	return setup_err;
+}
+#endif // MY_LINUX_VERSION_CODE >= 395520
+
 // Check whether a kernel symbol is present in /proc/kallsyms.
 static int netdata_core_symbol_in_kallsyms(const char *name)
 {
@@ -333,8 +492,8 @@ static void netdata_core_select_kprobe_programs(struct bpf_object *obj)
 }
 
 static int netdata_core_run_buffer_skel_test(const char *name, const char *ctrl_name, int map_level, int iterations,
-					     int *attached, int *skipped, int *maps, int *ring_maps,
-					     char *maps_json_buf, int maps_json_size)
+						     int *attached, int *skipped, int *maps, int *ring_maps,
+						     char *maps_json_buf, int maps_json_size)
 {
 	const struct netdata_core_buffer_skel_ops *ops = netdata_core_find_buffer_skel_ops(name);
 	struct bpf_link *links[64] = { 0 };
@@ -452,6 +611,151 @@ out:
 
 	return err;
 }
+
+#if MY_LINUX_VERSION_CODE >= 395520
+static int netdata_core_run_arena_skel_test(const char *name, const char *ctrl_name, int map_level, int iterations,
+					    int *attached, int *skipped, int *maps, int *ring_maps,
+					    char *maps_json_buf, int maps_json_size)
+{
+	const struct netdata_core_buffer_skel_ops *ops = netdata_core_find_arena_skel_ops(name);
+	struct bpf_link *links[64] = { 0 };
+	struct bpf_object *obj;
+	struct bpf_program *prog;
+	struct bpf_map *map;
+	void *skel = NULL;
+	size_t link_count = 0;
+	int err = 0;
+	size_t i;
+	int maps_pos = 0;
+
+	*attached = 0;
+	*skipped = 0;
+	*maps = 0;
+	*ring_maps = 0;
+
+	if (maps_json_buf && maps_json_size > 0)
+		maps_json_buf[0] = '\0';
+
+	if (!ops)
+		return -ENOENT;
+
+	skel = ops->open();
+	err = (int)libbpf_get_error(skel);
+	if (err) {
+		skel = NULL;
+		goto out;
+	}
+
+	obj = ((struct netdata_core_buffer_skel_base *)skel)->obj;
+	netdata_core_select_kprobe_programs(obj);
+	err = ops->load(skel);
+	if (err)
+		goto out;
+
+	netdata_core_fill_ctrl_map(obj, ctrl_name, map_level);
+
+	bpf_object__for_each_program(prog, obj) {
+		struct bpf_link *link;
+
+		if (bpf_program__type(prog) == BPF_PROG_TYPE_SOCKET_FILTER) {
+			(*skipped)++;
+			continue;
+		}
+
+		if (link_count >= sizeof(links) / sizeof(links[0])) {
+			err = -ENOSPC;
+			goto out;
+		}
+
+		if (bpf_program__fd(prog) < 0)
+			continue;
+
+		link = bpf_program__attach(prog);
+		err = (int)libbpf_get_error(link);
+		if (err) {
+			if (err == -ENOENT) {
+				err = 0;
+				continue;
+			}
+			goto out;
+		}
+
+		links[link_count++] = link;
+		(*attached)++;
+	}
+
+	bpf_object__for_each_map(map, obj) {
+		int map_type = (int)bpf_map__type(map);
+		const char *map_name = bpf_map__name(map);
+		char map_json[2048];
+		int n;
+
+		(*maps)++;
+		if (map_type != BPF_MAP_TYPE_RINGBUF && map_type != BPF_MAP_TYPE_USER_RINGBUF
+		    && map_type != BPF_MAP_TYPE_ARENA)
+			continue;
+
+		if (maps_json_buf && maps_json_size > maps_pos) {
+			if (maps_pos > 0) {
+				n = snprintf(maps_json_buf + maps_pos, (size_t)(maps_json_size - maps_pos), ",\n");
+				if (n > 0) maps_pos += n;
+			}
+			n = snprintf(maps_json_buf + maps_pos, (size_t)(maps_json_size - maps_pos),
+				"        \"%s\" : ", map_name);
+			if (n > 0) maps_pos += n;
+		}
+
+		if (map_type == BPF_MAP_TYPE_RINGBUF || map_type == BPF_MAP_TYPE_USER_RINGBUF)
+			(*ring_maps)++;
+
+		map_json[0] = '\0';
+		if (map_type == BPF_MAP_TYPE_ARENA)
+			err = netdata_core_test_arena_map(map, iterations, map_json, (int)sizeof(map_json));
+		else
+			err = netdata_core_test_ringbuf_map(map, iterations, map_json, (int)sizeof(map_json));
+
+		if (maps_json_buf && maps_json_size > maps_pos) {
+			n = snprintf(maps_json_buf + maps_pos, (size_t)(maps_json_size - maps_pos), "%s", map_json);
+			if (n > 0) maps_pos += n;
+			if (maps_pos < maps_json_size)
+				maps_json_buf[maps_pos] = '\0';
+		}
+
+		if (err)
+			goto out;
+	}
+
+	if (maps_json_buf && maps_pos < maps_json_size)
+		maps_json_buf[maps_pos] = '\0';
+
+out:
+	for (i = 0; i < link_count; i++)
+		bpf_link__destroy(links[i]);
+	if (skel)
+		ops->destroy(skel);
+
+	return err;
+}
+#else // MY_LINUX_VERSION_CODE < 395520 (but >= 329728): arena not supported
+static int netdata_core_run_arena_skel_test(const char *name, const char *ctrl_name,
+	int map_level, int iterations, int *attached, int *skipped, int *maps, int *ring_maps,
+	char *maps_json_buf, int maps_json_size)
+{
+	(void)name; (void)ctrl_name; (void)map_level; (void)iterations;
+	(void)attached; (void)skipped; (void)maps; (void)ring_maps;
+	(void)maps_json_buf; (void)maps_json_size;
+	return -ENOSYS;
+}
+#endif // MY_LINUX_VERSION_CODE >= 395520
+
+static int netdata_core_arena_supported(void)
+{
+#if MY_LINUX_VERSION_CODE >= 395520
+	return 1;
+#else
+	return 0;
+#endif
+}
 #else
 static int netdata_core_run_buffer_skel_test(const char *name, const char *ctrl_name,
 	int map_level, int iterations, int *attached, int *skipped, int *maps, int *ring_maps,
@@ -461,6 +765,19 @@ static int netdata_core_run_buffer_skel_test(const char *name, const char *ctrl_
 	(void)attached; (void)skipped; (void)maps; (void)ring_maps;
 	(void)maps_json_buf; (void)maps_json_size;
 	return -ENOSYS;
+}
+static int netdata_core_run_arena_skel_test(const char *name, const char *ctrl_name,
+	int map_level, int iterations, int *attached, int *skipped, int *maps, int *ring_maps,
+	char *maps_json_buf, int maps_json_size)
+{
+	(void)name; (void)ctrl_name; (void)map_level; (void)iterations;
+	(void)attached; (void)skipped; (void)maps; (void)ring_maps;
+	(void)maps_json_buf; (void)maps_json_size;
+	return -ENOSYS;
+}
+static int netdata_core_arena_supported(void)
+{
+	return 0;
 }
 #endif // MY_LINUX_VERSION_CODE >= 329728
 
@@ -484,6 +801,10 @@ import (
 	"strings"
 	"unsafe"
 )
+
+func init() {
+	C.netdata_disable_libbpf_memlock_rlim()
+}
 
 const (
 	modeNone       = uint(0)
@@ -537,6 +858,7 @@ type aggregateTestCase struct {
 	emitModeArg       bool
 	pidSupported      bool
 	bufferSupported   bool
+	arenaSupported    bool
 	bufferCtrl        string
 }
 
@@ -559,28 +881,29 @@ type aggregateState struct {
 	selectionMask     uint64
 	explicitSelection bool
 	bufferMode        bool
+	arenaMode         bool
 	bufferIterations  int
 	testsDir          string
 }
 
 var aggregateTests = []aggregateTestCase{
-	{name: "cachestat", binary: "cachestat", selectionBit: selectCachestat, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, bufferCtrl: "cstat_ctrl"},
-	{name: "dc", binary: "dc", selectionBit: selectDC, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, bufferCtrl: "dcstat_ctrl"},
+	{name: "cachestat", binary: "cachestat", selectionBit: selectCachestat, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, arenaSupported: true, bufferCtrl: "cstat_ctrl"},
+	{name: "dc", binary: "dc", selectionBit: selectDC, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, arenaSupported: true, bufferCtrl: "dcstat_ctrl"},
 	{name: "disk", binary: "disk", selectionBit: selectDisk},
-	{name: "dns", binary: "dns", selectionBit: selectDNS, bufferSupported: true},
-	{name: "fd", binary: "fd", selectionBit: selectFD, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, bufferCtrl: "fd_ctrl"},
+	{name: "dns", binary: "dns", selectionBit: selectDNS, bufferSupported: true, arenaSupported: true},
+	{name: "fd", binary: "fd", selectionBit: selectFD, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, arenaSupported: true, bufferCtrl: "fd_ctrl"},
 	{name: "hardirq", binary: "hardirq", selectionBit: selectHardirq},
 	{name: "mdflush", binary: "mdflush", selectionBit: selectMdflush, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true},
 	{name: "mount", binary: "mount", selectionBit: selectMount, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true},
 	{name: "networkviewer", binary: "networkviewer", selectionBit: selectNetworkviewer, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true},
-	{name: "oomkill", binary: "oomkill", selectionBit: selectOOMKill, bufferSupported: true},
-	{name: "process", binary: "process", selectionBit: selectProcess, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, bufferCtrl: "process_ctrl"},
-	{name: "shm", binary: "shm", selectionBit: selectSHM, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, bufferCtrl: "shm_ctrl"},
+	{name: "oomkill", binary: "oomkill", selectionBit: selectOOMKill, bufferSupported: true, arenaSupported: true},
+	{name: "process", binary: "process", selectionBit: selectProcess, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, arenaSupported: true, bufferCtrl: "process_ctrl"},
+	{name: "shm", binary: "shm", selectionBit: selectSHM, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, arenaSupported: true, bufferCtrl: "shm_ctrl"},
 	{name: "socket", binary: "socket", selectionBit: selectSocket, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true},
 	{name: "softirq", binary: "softirq", selectionBit: selectSoftirq},
-	{name: "swap", binary: "swap", selectionBit: selectSwap, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, bufferCtrl: "swap_ctrl"},
+	{name: "swap", binary: "swap", selectionBit: selectSwap, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, arenaSupported: true, bufferCtrl: "swap_ctrl"},
 	{name: "sync", binary: "sync", selectionBit: selectSync, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true},
-	{name: "vfs", binary: "vfs", selectionBit: selectVFS, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, bufferCtrl: "vfs_ctrl"},
+	{name: "vfs", binary: "vfs", selectionBit: selectVFS, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, arenaSupported: true, bufferCtrl: "vfs_ctrl"},
 	{name: "nfs", binary: "filesystem", extraArg: "--nfs", selectionBit: selectNFS, modes: modeProbe},
 	{name: "ext4", binary: "filesystem", extraArg: "--ext4", selectionBit: selectExt4, modes: modeProbe},
 	{name: "btrfs", binary: "filesystem", extraArg: "--btrfs", selectionBit: selectBtrfs, modes: modeProbe},
@@ -795,6 +1118,73 @@ func executeBufferTest(state aggregateState, test aggregateTestCase) (aggregateR
 	return result, 0
 }
 
+func executeArenaTest(state aggregateState, test aggregateTestCase) (aggregateResult, int) {
+	result := initResult(test)
+	result.mode = "arena"
+	result.binary = test.name + "_arena.skel.h"
+	result.command = test.name + "_arena skeleton"
+	if state.selectedPID >= 0 {
+		result.pid = state.selectedPID
+	}
+
+	if !test.arenaSupported {
+		result.status = "Unavailable"
+		result.detail = "Collector has no CO-RE arena object."
+		return result, 0
+	}
+
+	if C.netdata_core_arena_supported() == 0 {
+		result.status = "Unavailable"
+		result.detail = "Arena collection requires kernel >= 6.9."
+		return result, 0
+	}
+
+	mapLevel := state.selectedPID
+	if mapLevel < 0 {
+		mapLevel = pidMin
+	}
+
+	_, _ = fmt.Fprintf(os.Stderr, "Running arena skeleton test %s\n", result.command)
+
+	cName := C.CString(test.name)
+	defer C.free(unsafe.Pointer(cName))
+
+	cCtrl := C.CString(test.bufferCtrl)
+	defer C.free(unsafe.Pointer(cCtrl))
+
+	attached := C.int(0)
+	skipped := C.int(0)
+	maps := C.int(0)
+	ringMaps := C.int(0)
+	var mapsBuf [4096]C.char
+	errCode := int(C.netdata_core_run_arena_skel_test(
+		cName,
+		cCtrl,
+		C.int(mapLevel),
+		C.int(state.bufferIterations),
+		&attached,
+		&skipped,
+		&maps,
+		&ringMaps,
+		&mapsBuf[0],
+		C.int(len(mapsBuf)),
+	))
+	mapsJSON := C.GoString(&mapsBuf[0])
+	if errCode != 0 {
+		result.status = "Fail"
+		result.exitCode = errCode
+		result.detail = fmt.Sprintf("Arena skeleton test failed with error %d.", errCode)
+		result.mapsJSON = mapsJSON
+		return result, 1
+	}
+
+	result.status = "Success"
+	result.detail = fmt.Sprintf("Loaded object, attached %d programs, skipped %d socket filters, checked %d maps and %d ring buffers.",
+		int(attached), int(skipped), int(maps), int(ringMaps))
+	result.mapsJSON = mapsJSON
+	return result, 0
+}
+
 func printHelp(out io.Writer, name string) {
 	_, _ = fmt.Fprintf(out,
 		"%s runs the CO-RE tests in-process and aggregates their results.\n\n"+
@@ -807,6 +1197,7 @@ func printHelp(out io.Writer, name string) {
 			"  --tests-dir PATH  Accepted for compatibility and ignored in in-process mode.\n"+
 			"  --log-path FILE   Write the aggregate JSON summary to FILE instead of stdout.\n"+
 			"  --buffer          Test CO-RE ring-buffer BPF objects instead of standalone loaders.\n"+
+			"  --arena           Test CO-RE arena BPF objects using compiled-in skeletons.\n"+
 			"\n"+
 			"Selectors:\n"+
 			"  --cachestat --dc --disk --dns --fd --hardirq --mdflush --mount\n"+
@@ -932,6 +1323,11 @@ func parseArgs(args []string) (aggregateState, string, bool, error) {
 		case "all":
 			state.selectionMask |= selectAllNonFilesystem
 			state.explicitSelection = true
+		case "arena":
+			if state.bufferMode {
+				return state, logPath, false, fmt.Errorf("--buffer and --arena are mutually exclusive")
+			}
+			state.arenaMode = true
 		case "cachestat":
 			state.selectionMask |= selectCachestat
 			state.explicitSelection = true
@@ -1002,6 +1398,9 @@ func parseArgs(args []string) (aggregateState, string, bool, error) {
 			state.selectionMask |= selectZFS
 			state.explicitSelection = true
 		case "buffer":
+			if state.arenaMode {
+				return state, logPath, false, fmt.Errorf("--buffer and --arena are mutually exclusive")
+			}
 			state.bufferMode = true
 		default:
 			return state, logPath, false, fmt.Errorf("unrecognized option '--%s'", option)
@@ -1058,6 +1457,20 @@ func main() {
 			}
 
 			result, exitCode := executeBufferTest(state, test)
+			if exitCode != 0 {
+				failures++
+			}
+			writeResult(report, result, &first)
+			resultCount++
+			continue
+		}
+
+		if state.arenaMode {
+			if !test.arenaSupported {
+				continue
+			}
+
+			result, exitCode := executeArenaTest(state, test)
 			if exitCode != 0 {
 				failures++
 			}

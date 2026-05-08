@@ -10,6 +10,7 @@
 
 *.skel.h
 *.a
+*.d
 
 src/embedded
 src/tests/*
@@ -18,3 +19,5 @@ src/tests/*
 .local_libbpf/pkgconfig
 !src/tests/*.sh
 
+.codex
+TODO*.md

@@ -8,12 +8,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
 #include "netdata_core_loader.h"
+#ifndef TASK_COMM_LEN
+#define TASK_COMM_LEN 16
+#endif
 /* BPF_MAP_TYPE_RINGBUF requires kernel >= 5.8 (version code 329728). */
 #if MY_LINUX_VERSION_CODE >= 329728
 #include "cachestat_buffer.skel.h"
@@ -26,6 +30,49 @@
 #include "swap_buffer.skel.h"
 #include "vfs_buffer.skel.h"
 #endif /* MY_LINUX_VERSION_CODE >= 329728 */
+
+/* BPF_MAP_TYPE_ARENA requires kernel >= 6.9 (version code 395520). */
+#if MY_LINUX_VERSION_CODE >= 395520
+#include "netdata_cachestat_arena.h"
+#include "netdata_dc_arena.h"
+#include "netdata_dns_arena.h"
+#include "netdata_fd_arena.h"
+#include "netdata_oomkill_arena.h"
+#include "netdata_process_arena.h"
+#include "netdata_shm_arena.h"
+#include "netdata_swap_arena.h"
+#include "netdata_vfs_arena.h"
+
+#include "cachestat_arena.skel.h"
+#include "dc_arena.skel.h"
+#include "dns_arena.skel.h"
+#include "fd_arena.skel.h"
+#include "oomkill_arena.skel.h"
+#include "process_arena.skel.h"
+#include "shm_arena.skel.h"
+#include "swap_arena.skel.h"
+#include "vfs_arena.skel.h"
+#endif /* MY_LINUX_VERSION_CODE >= 395520 */
+
+/* cgo and some compilers are more conservative about inline skeleton helpers. */
+#if MY_LINUX_VERSION_CODE >= 395520
+#define DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(prefix) \
+    struct prefix##_bpf; \
+    static struct prefix##_bpf *prefix##_bpf__open(void); \
+    static int prefix##_bpf__load(struct prefix##_bpf *obj); \
+    static void prefix##_bpf__destroy(struct prefix##_bpf *obj)
+
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(cachestat_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(dc_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(dns_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(fd_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(oomkill_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(process_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(shm_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(swap_arena);
+DECLARE_NETDATA_CORE_ARENA_SKEL_OPS(vfs_arena);
+#undef DECLARE_NETDATA_CORE_ARENA_SKEL_OPS
+#endif /* MY_LINUX_VERSION_CODE >= 395520 */
 
 #define MODE_NONE        0U
 #define MODE_PROBE       (1U << 0)
@@ -73,6 +120,7 @@ enum option_ids {
     OPT_TESTS_DIR,
     OPT_LOG_PATH,
     OPT_ALL,
+    OPT_ARENA,
     OPT_CACHESTAT,
     OPT_DC,
     OPT_DISK,
@@ -112,6 +160,7 @@ typedef struct aggregate_test_case {
     int emit_mode_arg;
     int pid_supported;
     int buffer_supported;
+    int arena_supported;
     const char *buffer_ctrl;
 } aggregate_test_case_t;
 
@@ -134,6 +183,7 @@ typedef struct aggregate_state {
     uint64_t selection_mask;
     int explicit_selection;
     int buffer_mode;
+    int arena_mode;
     int buffer_iterations;
     const char *tests_dir;
 } aggregate_state_t;
@@ -190,17 +240,53 @@ static const buffer_skel_ops_t buffer_skel_ops[] = {
 };
 #endif /* MY_LINUX_VERSION_CODE >= 329728 */
 
+#if MY_LINUX_VERSION_CODE >= 395520
+DEFINE_BUFFER_SKEL_OPS(cachestat_arena)
+DEFINE_BUFFER_SKEL_OPS(dc_arena)
+DEFINE_BUFFER_SKEL_OPS(dns_arena)
+DEFINE_BUFFER_SKEL_OPS(fd_arena)
+DEFINE_BUFFER_SKEL_OPS(oomkill_arena)
+DEFINE_BUFFER_SKEL_OPS(process_arena)
+DEFINE_BUFFER_SKEL_OPS(shm_arena)
+DEFINE_BUFFER_SKEL_OPS(swap_arena)
+DEFINE_BUFFER_SKEL_OPS(vfs_arena)
+
+static const buffer_skel_ops_t arena_skel_ops[] = {
+    { "cachestat", open_cachestat_arena, load_cachestat_arena, destroy_cachestat_arena },
+    { "dc", open_dc_arena, load_dc_arena, destroy_dc_arena },
+    { "dns", open_dns_arena, load_dns_arena, destroy_dns_arena },
+    { "fd", open_fd_arena, load_fd_arena, destroy_fd_arena },
+    { "oomkill", open_oomkill_arena, load_oomkill_arena, destroy_oomkill_arena },
+    { "process", open_process_arena, load_process_arena, destroy_process_arena },
+    { "shm", open_shm_arena, load_shm_arena, destroy_shm_arena },
+    { "swap", open_swap_arena, load_swap_arena, destroy_swap_arena },
+    { "vfs", open_vfs_arena, load_vfs_arena, destroy_vfs_arena },
+};
+
+static const buffer_skel_ops_t *find_arena_skel_ops(const char *name)
+{
+    size_t i;
+
+    for (i = 0; i < sizeof(arena_skel_ops) / sizeof(arena_skel_ops[0]); i++) {
+        if (!strcmp(arena_skel_ops[i].name, name))
+            return &arena_skel_ops[i];
+    }
+
+    return NULL;
+}
+#endif /* MY_LINUX_VERSION_CODE >= 395520 */
+
 static const aggregate_test_case_t aggregate_tests[] = {
     { "cachestat", "cachestat", netdata_cachestat_entry, NULL, NULL, SELECT_CACHESTAT,
-      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, "cstat_ctrl" },
+      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, 1, "cstat_ctrl" },
     { "dc", "dc", netdata_dc_entry, NULL, NULL, SELECT_DC,
-      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, "dcstat_ctrl" },
+      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, 1, "dcstat_ctrl" },
     { "disk", "disk", netdata_disk_entry, NULL, NULL, SELECT_DISK,
       MODE_NONE, 0, 0 },
     { "dns", "dns", netdata_dns_entry, NULL, NULL, SELECT_DNS,
-      MODE_NONE, 0, 0, 1, NULL },
+      MODE_NONE, 0, 0, 1, 1, NULL },
     { "fd", "fd", netdata_fd_entry, NULL, NULL, SELECT_FD,
-      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, "fd_ctrl" },
+      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, 1, "fd_ctrl" },
     { "hardirq", "hardirq", netdata_hardirq_entry, NULL, NULL, SELECT_HARDIRQ,
       MODE_NONE, 0, 0 },
     { "mdflush", "mdflush", netdata_mdflush_entry, NULL, NULL, SELECT_MDFLUSH,
@@ -210,21 +296,21 @@ static const aggregate_test_case_t aggregate_tests[] = {
     { "networkviewer", "networkviewer", netdata_networkviewer_entry, NULL, NULL, SELECT_NETWORKVIEWER,
       MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1 },
     { "oomkill", "oomkill", netdata_oomkill_entry, NULL, NULL, SELECT_OOMKILL,
-      MODE_NONE, 0, 0, 1, NULL },
+      MODE_NONE, 0, 0, 1, 1, NULL },
     { "process", "process", netdata_process_entry, NULL, NULL, SELECT_PROCESS,
-      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, "process_ctrl" },
+      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, 1, "process_ctrl" },
     { "shm", "shm", netdata_shm_entry, NULL, NULL, SELECT_SHM,
-      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, "shm_ctrl" },
+      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, 1, "shm_ctrl" },
     { "socket", "socket", netdata_socket_entry, NULL, NULL, SELECT_SOCKET,
       MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1 },
     { "softirq", "softirq", netdata_softirq_entry, NULL, NULL, SELECT_SOFTIRQ,
       MODE_NONE, 0, 0 },
     { "swap", "swap", netdata_swap_entry, NULL, NULL, SELECT_SWAP,
-      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, "swap_ctrl" },
+      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, 1, "swap_ctrl" },
     { "sync", "sync", netdata_sync_entry, NULL, NULL, SELECT_SYNC,
       MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 0 },
     { "vfs", "vfs", netdata_vfs_entry, NULL, NULL, SELECT_VFS,
-      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, "vfs_ctrl" },
+      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, 1, "vfs_ctrl" },
     { "nfs", "filesystem", netdata_filesystem_entry, "--nfs", NULL, SELECT_NFS,
       MODE_PROBE, 0, 0 },
     { "ext4", "filesystem", netdata_filesystem_entry, "--ext4", NULL, SELECT_EXT4,
@@ -607,6 +693,77 @@ static int test_ringbuf_map(struct bpf_map *map, int iterations,
     return op_error;
 }
 
+#if MY_LINUX_VERSION_CODE >= 395520
+static int test_arena_map(struct bpf_map *map, int iterations,
+                          char *map_json_buf, size_t map_json_size)
+{
+    int fd = bpf_map__fd(map);
+    uint32_t key_size = bpf_map__key_size(map);
+    uint32_t value_size = bpf_map__value_size(map);
+    size_t arena_sz = (size_t)bpf_map__max_entries(map) * (size_t)sysconf(_SC_PAGE_SIZE);
+    size_t data_sz = 0;
+    /* arena is already mmap'd by libbpf at load time; MAP_FIXED + map_extra required */
+    void *arena_mem = bpf_map__initial_value(map, &data_sz);
+    int setup_error = arena_mem ? 0 : -EINVAL;
+    uint32_t prev_head = 0;
+    size_t pos = 0;
+    char errbuf[128];
+    int n, i;
+
+    n = snprintf(map_json_buf + pos, map_json_size - pos,
+        "{\n"
+        "            \"Info\" : { \"Length\" : { \"Key\" : %u, \"Value\" : %u},\n"
+        "                       \"Type\" : %u,\n"
+        "                       \"FD\" : %d,\n"
+        "                       \"Data\" : [\n",
+        key_size, value_size, (unsigned)BPF_MAP_TYPE_ARENA, fd);
+    if (n > 0) pos += (size_t)n;
+
+    if (arena_mem)
+        prev_head = *(volatile uint32_t *)arena_mem;
+
+    for (i = 0; i < iterations; i++) {
+        uint32_t cur_head = 0;
+        uint32_t delta = 0;
+
+        sleep(10);
+
+        if (arena_mem) {
+            cur_head = *(volatile uint32_t *)arena_mem;
+            delta = cur_head - prev_head;
+            prev_head = cur_head;
+        }
+
+        if (i > 0 && pos < map_json_size - 1) {
+            n = snprintf(map_json_buf + pos, map_json_size - pos, ",\n");
+            if (n > 0) pos += (size_t)n;
+        }
+
+        n = snprintf(map_json_buf + pos, map_json_size - pos,
+            "                                    "
+            "{ \"Iteration\" : %d, \"Mode\" : \"arena_consumer\", \"Setup\" : %d, "
+            "\"Operation Result\" : %u, \"Samples\" : %u, \"Bytes\" : 0, "
+            "\"Available\" : 0, \"Ring Size\" : %zu, \"Error Code\" : %d, "
+            "\"Error Message\" : \"%s\" }",
+            i, !setup_error, (unsigned)delta, (unsigned)delta, arena_sz,
+            setup_error, format_error(setup_error, errbuf, sizeof(errbuf)));
+        if (n > 0) pos += (size_t)n;
+        if (pos >= map_json_size - 1)
+            pos = map_json_size - 1;
+    }
+
+    n = snprintf(map_json_buf + pos, map_json_size - pos,
+        "\n                                ]\n"
+        "                      }\n"
+        "        }");
+    if (n > 0) pos += (size_t)n;
+    if (pos < map_json_size)
+        map_json_buf[pos] = '\0';
+
+    return setup_error;
+}
+#endif /* MY_LINUX_VERSION_CODE >= 395520 */
+
 static int netdata_core_symbol_in_kallsyms(const char *name)
 {
     FILE *f;
@@ -676,7 +833,7 @@ static void netdata_core_select_kprobe_programs(struct bpf_object *obj)
 }
 
 static int attach_buffer_programs(struct bpf_object *obj, struct bpf_link **links, size_t links_len,
-                                  size_t *attached, size_t *skipped)
+                                  int *attached, int *skipped)
 {
     struct bpf_program *prog;
     int last_error = 0;
@@ -713,22 +870,101 @@ static int attach_buffer_programs(struct bpf_object *obj, struct bpf_link **link
     return 0;
 }
 
+static int netdata_core_arena_supported(void);
+
+static int run_loaded_buffer_test(struct bpf_object *obj, int iterations,
+				  int *attached, int *skipped, int *maps, int *ringbuf_maps,
+				  char *maps_json_buf, size_t maps_json_size)
+{
+    struct bpf_link *links[64] = { 0 };
+    struct bpf_map *map;
+    int link_count = 0;
+    int err = 0;
+    int i;
+    size_t maps_json_pos = 0;
+    char map_json_buf[2048];
+
+    *attached = 0;
+    *skipped = 0;
+    *maps = 0;
+    *ringbuf_maps = 0;
+
+    if (maps_json_buf && maps_json_size > 0)
+        maps_json_buf[0] = '\0';
+
+    err = attach_buffer_programs(obj, links, sizeof(links) / sizeof(links[0]), attached, skipped);
+    if (err)
+        goto out;
+
+    link_count = *attached;
+
+    bpf_object__for_each_map(map, obj) {
+        enum bpf_map_type map_type = bpf_map__type(map);
+        const char *map_name = bpf_map__name(map);
+        int tracked = map_is_ringbuf(map_type);
+        int n;
+
+        (*maps)++;
+#if MY_LINUX_VERSION_CODE >= 395520
+        if (!tracked)
+            tracked = (map_type == BPF_MAP_TYPE_ARENA);
+#endif
+        if (!tracked)
+            continue;
+
+        if (maps_json_pos > 0 && maps_json_pos < maps_json_size - 1) {
+            n = snprintf(maps_json_buf + maps_json_pos,
+                         maps_json_size - maps_json_pos, ",\n");
+            if (n > 0) maps_json_pos += (size_t)n;
+        }
+        n = snprintf(maps_json_buf + maps_json_pos,
+                     maps_json_size - maps_json_pos,
+                     "        \"%s\" : ", map_name);
+        if (n > 0) maps_json_pos += (size_t)n;
+
+        if (map_is_ringbuf(map_type))
+            (*ringbuf_maps)++;
+
+        map_json_buf[0] = '\0';
+#if MY_LINUX_VERSION_CODE >= 395520
+        if (map_type == BPF_MAP_TYPE_ARENA)
+            err = test_arena_map(map, iterations,
+                                 map_json_buf, sizeof(map_json_buf));
+        else
+#endif
+        err = test_ringbuf_map(map, iterations,
+                               map_json_buf, sizeof(map_json_buf));
+
+        n = snprintf(maps_json_buf + maps_json_pos,
+                     maps_json_size - maps_json_pos, "%s", map_json_buf);
+        if (n > 0) maps_json_pos += (size_t)n;
+        if (maps_json_pos >= maps_json_size - 1)
+            maps_json_pos = maps_json_size - 1;
+        maps_json_buf[maps_json_pos] = '\0';
+
+        if (err)
+            goto out;
+    }
+
+out:
+    for (i = 0; i < link_count; i++)
+        bpf_link__destroy(links[i]);
+
+    return err;
+}
+
 static int execute_buffer_test(const aggregate_state_t *state, const aggregate_test_case_t *test,
                                aggregate_result_t *result)
 {
     const buffer_skel_ops_t *ops;
+    buffer_skel_base_t *base;
     void *skel = NULL;
     struct bpf_object *obj = NULL;
-    struct bpf_map *map;
-    struct bpf_link *links[64] = { 0 };
-    size_t attached = 0;
-    size_t skipped = 0;
-    size_t ringbuf_maps = 0;
-    size_t maps = 0;
+    int attached = 0;
+    int skipped = 0;
+    int ringbuf_maps = 0;
+    int maps = 0;
     int err = 0;
-    size_t i;
-    size_t maps_json_pos = 0;
-    char map_json_buf[2048];
 
     init_result(result, test);
     snprintf(result->mode, sizeof(result->mode), "%s", "buffer");
@@ -760,7 +996,8 @@ static int execute_buffer_test(const aggregate_state_t *state, const aggregate_t
         skel = NULL;
         goto fail;
     }
-    obj = ((buffer_skel_base_t *)skel)->obj;
+    base = (buffer_skel_base_t *)skel;
+    obj = base->obj;
     netdata_core_select_kprobe_programs(obj);
 
     err = ops->load(skel);
@@ -769,57 +1006,20 @@ static int execute_buffer_test(const aggregate_state_t *state, const aggregate_t
 
     fill_ctrl_map(obj, test->buffer_ctrl, state->selected_pid >= 0 ? state->selected_pid : PID_MIN);
 
-    err = attach_buffer_programs(obj, links, sizeof(links) / sizeof(links[0]), &attached, &skipped);
+    err = run_loaded_buffer_test(obj, state->buffer_iterations, &attached, &skipped, &maps, &ringbuf_maps,
+                                 result->maps_json, sizeof(result->maps_json));
     if (err)
         goto fail;
 
-    bpf_object__for_each_map(map, obj) {
-        const char *map_name = bpf_map__name(map);
-        int n;
-
-        maps++;
-        if (!map_is_ringbuf(bpf_map__type(map)))
-            continue;
-
-        if (maps_json_pos > 0 && maps_json_pos < sizeof(result->maps_json) - 1) {
-            n = snprintf(result->maps_json + maps_json_pos,
-                         sizeof(result->maps_json) - maps_json_pos, ",\n");
-            if (n > 0) maps_json_pos += (size_t)n;
-        }
-        n = snprintf(result->maps_json + maps_json_pos,
-                     sizeof(result->maps_json) - maps_json_pos,
-                     "        \"%s\" : ", map_name);
-        if (n > 0) maps_json_pos += (size_t)n;
-
-        ringbuf_maps++;
-        map_json_buf[0] = '\0';
-        err = test_ringbuf_map(map, state->buffer_iterations,
-                               map_json_buf, sizeof(map_json_buf));
-
-        n = snprintf(result->maps_json + maps_json_pos,
-                     sizeof(result->maps_json) - maps_json_pos, "%s", map_json_buf);
-        if (n > 0) maps_json_pos += (size_t)n;
-        if (maps_json_pos >= sizeof(result->maps_json) - 1)
-            maps_json_pos = sizeof(result->maps_json) - 1;
-        result->maps_json[maps_json_pos] = '\0';
-
-        if (err)
-            goto fail;
-    }
-
-    for (i = 0; i < attached; i++)
-        bpf_link__destroy(links[i]);
-    ops->destroy(skel);
-
     snprintf(result->status, sizeof(result->status), "%s", "Success");
     snprintf(result->detail, sizeof(result->detail),
-             "Loaded object, attached %zu programs, skipped %zu socket filters, checked %zu maps and %zu ring buffers.",
+             "Loaded object, attached %d programs, skipped %d socket filters, checked %d maps and %d ring buffers.",
              attached, skipped, maps, ringbuf_maps);
+    if (skel)
+        ops->destroy(skel);
     return 0;
 
-fail:
-    for (i = 0; i < attached; i++)
-        bpf_link__destroy(links[i]);
+    fail:
     if (skel)
         ops->destroy(skel);
 
@@ -828,7 +1028,103 @@ fail:
     result->exit_code = err ? err : 1;
     return 1;
 }
+
+static int execute_arena_test(const aggregate_state_t *state, const aggregate_test_case_t *test,
+                              aggregate_result_t *result)
+{
+    init_result(result, test);
+    snprintf(result->mode, sizeof(result->mode), "%s", "arena");
+    snprintf(result->binary, sizeof(result->binary), "%s_arena.skel.h", test->name);
+    snprintf(result->command, sizeof(result->command), "%s_arena skeleton", test->name);
+    if (state->selected_pid >= 0)
+        result->pid = state->selected_pid;
+
+    if (!test->arena_supported) {
+        snprintf(result->status, sizeof(result->status), "%s", "Unavailable");
+        snprintf(result->detail, sizeof(result->detail), "%s", "Collector has no CO-RE arena object.");
+        return 0;
+    }
+
+    if (!netdata_core_arena_supported()) {
+        snprintf(result->status, sizeof(result->status), "%s", "Unavailable");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "Arena collection requires kernel >= 6.9.");
+        return 0;
+    }
+
+#if MY_LINUX_VERSION_CODE >= 395520
+    {
+        const buffer_skel_ops_t *ops;
+        buffer_skel_base_t *base;
+        void *skel = NULL;
+        struct bpf_object *obj = NULL;
+        int attached = 0, skipped = 0, ringbuf_maps = 0, maps = 0;
+        int err = 0;
+
+        ops = find_arena_skel_ops(test->name);
+        if (!ops) {
+            snprintf(result->status, sizeof(result->status), "%s", "Fail");
+            snprintf(result->detail, sizeof(result->detail), "%s",
+                     "Arena skeleton is not compiled into this tester.");
+            return 1;
+        }
+
+        fprintf(stderr, "Running arena skeleton test %s\n", result->command);
+
+        skel = ops->open();
+        err = libbpf_get_error(skel);
+        if (err) {
+            skel = NULL;
+            goto arena_fail;
+        }
+        base = (buffer_skel_base_t *)skel;
+        obj = base->obj;
+        netdata_core_select_kprobe_programs(obj);
+
+        err = ops->load(skel);
+        if (err)
+            goto arena_fail;
+
+        fill_ctrl_map(obj, test->buffer_ctrl, state->selected_pid >= 0 ? state->selected_pid : PID_MIN);
+
+        err = run_loaded_buffer_test(obj, state->buffer_iterations, &attached, &skipped, &maps, &ringbuf_maps,
+                                     result->maps_json, sizeof(result->maps_json));
+        if (err)
+            goto arena_fail;
+
+        snprintf(result->status, sizeof(result->status), "%s", "Success");
+        snprintf(result->detail, sizeof(result->detail),
+                 "Loaded object, attached %d programs, skipped %d socket filters, checked %d maps and %d ring buffers.",
+                 attached, skipped, maps, ringbuf_maps);
+        ops->destroy(skel);
+        return 0;
+
+    arena_fail:
+        if (skel)
+            ops->destroy(skel);
+        snprintf(result->status, sizeof(result->status), "%s", "Fail");
+        snprintf(result->detail, sizeof(result->detail), "Arena skeleton test failed with error %d.", err);
+        result->exit_code = err ? err : 1;
+        return 1;
+    }
+#else
+    snprintf(result->status, sizeof(result->status), "%s", "Unavailable");
+    snprintf(result->detail, sizeof(result->detail), "%s",
+             "Arena skeleton not compiled into this tester.");
+    return 0;
+#endif
+}
+
 #endif /* MY_LINUX_VERSION_CODE >= 329728 */
+
+static int netdata_core_arena_supported(void)
+{
+#if MY_LINUX_VERSION_CODE >= 395520
+    return 1;
+#else
+    return 0;
+#endif
+}
 
 static void print_help(const char *name)
 {
@@ -843,6 +1139,7 @@ static void print_help(const char *name)
             "  --tests-dir PATH  Accepted for compatibility and ignored in standalone mode.\n"
             "  --log-path FILE   Write the aggregate JSON summary to FILE instead of stdout.\n"
             "  --buffer          Test CO-RE ring-buffer BPF objects instead of standalone loaders.\n"
+            "  --arena           Test CO-RE arena BPF objects using compiled-in skeletons.\n"
             "\n"
             "Selectors:\n"
             "  --cachestat --dc --disk --dns --fd --hardirq --mdflush --mount\n"
@@ -867,6 +1164,7 @@ int main(int argc, char **argv)
         { "tests-dir",     required_argument, 0, OPT_TESTS_DIR },
         { "log-path",      required_argument, 0, OPT_LOG_PATH },
         { "all",           no_argument,       0, OPT_ALL },
+        { "arena",         no_argument,       0, OPT_ARENA },
         { "cachestat",     no_argument,       0, OPT_CACHESTAT },
         { "dc",            no_argument,       0, OPT_DC },
         { "disk",          no_argument,       0, OPT_DISK },
@@ -939,6 +1237,13 @@ int main(int argc, char **argv)
             case OPT_ALL:
                 state.selection_mask |= SELECT_ALL_NON_FILESYSTEM;
                 state.explicit_selection = 1;
+                break;
+            case OPT_ARENA:
+                if (state.buffer_mode) {
+                    fprintf(stderr, "--buffer and --arena are mutually exclusive.\n");
+                    return 1;
+                }
+                state.arena_mode = 1;
                 break;
             case OPT_CACHESTAT:
                 state.selection_mask |= SELECT_CACHESTAT;
@@ -1033,6 +1338,10 @@ int main(int argc, char **argv)
                 state.explicit_selection = 1;
                 break;
             case OPT_BUFFER:
+                if (state.arena_mode) {
+                    fprintf(stderr, "--buffer and --arena are mutually exclusive.\n");
+                    return 1;
+                }
                 state.buffer_mode = 1;
                 break;
             default:
@@ -1070,6 +1379,22 @@ int main(int argc, char **argv)
 #else
             record_unavailable(&results[result_count], test,
                                "Ring buffer (BPF_MAP_TYPE_RINGBUF) requires kernel >= 5.8.");
+            unavailable++;
+#endif
+            write_result(report, &results[result_count], &first);
+            result_count++;
+            continue;
+        }
+
+        if (state.arena_mode) {
+            if (!test->arena_supported)
+                continue;
+
+#if MY_LINUX_VERSION_CODE >= 329728
+            failures += execute_arena_test(&state, test, &results[result_count]) != 0;
+#else
+            record_unavailable(&results[result_count], test,
+                               "Arena (BPF_MAP_TYPE_ARENA) requires kernel >= 6.9.");
             unavailable++;
 #endif
             write_result(report, &results[result_count], &first);

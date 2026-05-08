@@ -1,4 +1,5 @@
 LIBBPF = ../libbpf
+LIBBPF_ARTIFACT = ../.local_libbpf/libbpf.a
 CFLAGS = -Wall -ggdb
 INCLUDES = -I../.local_libbpf/ -I../includes/ -I$(LIBBPF)/src/ -I. -I../kernel-collector/includes/ -I$(LIBBPF)/include/uapi/
 CLANG ?= clang 
@@ -6,13 +7,16 @@ LLVM_STRIP ?= llvm-strip
 OUTPUT = tests/
 ARCH := $(shell uname -m | sed 's/x86_64/x86/')
 CLANG_BPF_SYS_INCLUDES = $(shell $(CLANG) -v -E - </dev/null 2>&1 \
-			 | sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }') 
+				 | sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }') 
 KERNEL_VERSION="$(shell cat /proc/sys/kernel/osrelease)"
 FIRST_KERNEL_VERSION=$(shell sh ../kernel-collector/tools/complement.sh "$(KERNEL_VERSION)")
 VER_MAJOR=$(shell echo $(KERNEL_VERSION) | cut -d. -f1)
 VER_MINOR=$(shell echo $(KERNEL_VERSION) | cut -d. -f2)
 VER_PATCH=$(shell echo $(KERNEL_VERSION) | cut -d. -f3 | cut -d\- -f1)
 RUNNING_VERSION_CODE=$(shell echo $$(( $(VER_MAJOR) * 65536 + $(VER_MINOR) * 256 + $(VER_PATCH))) )
+BPF_DEPFILES = $(patsubst %.bpf.c,%.bpf.d,$(wildcard *.bpf.c))
+
+-include $(BPF_DEPFILES)
 
 _LIBC ?= glibc
 
@@ -54,6 +58,24 @@ else
 RINGBUF_SKELS =
 endif
 
+# BPF_MAP_TYPE_ARENA requires kernel >= 6.9.
+ifeq ($(shell test $(RUNNING_VERSION_CODE) -ge 395520 ; echo $$?),0)
+ARENA_APPS = cachestat_arena \
+             dc_arena \
+             dns_arena \
+             fd_arena \
+             oomkill_arena \
+             process_arena \
+             shm_arena \
+             swap_arena \
+             vfs_arena \
+             #
+ARENA_SKELS = $(patsubst %,%.skel.h,$(ARENA_APPS))
+else
+ARENA_APPS =
+ARENA_SKELS =
+endif
+
 AGGREGATE_TESTER = core_tester
 AGGREGATE_TESTER_GO = core_tester_go
 GO ?= go
@@ -65,11 +87,13 @@ DNS_HELPER_OBJ = dns_tester_legacy.o
 
 all: compress $(OUTPUT)$(AGGREGATE_TESTER) $(OUTPUT)$(AGGREGATE_TESTER_GO)
 
-libbpf:
+libbpf: $(LIBBPF_ARTIFACT)
+
+$(LIBBPF_ARTIFACT):
 	cd $(LIBBPF)/src && $(MAKE) BUILD_STATIC_ONLY=1 DESTDIR=../../.local_libbpf INCLUDEDIR= LIBDIR= UAPIDIR= install \
 
 %.bpf.o: %.bpf.c libbpf
-	$(CLANG) -fno-stack-protector $(INCLUDES) -ggdb -O2 -target bpf -DMY_LINUX_VERSION_CODE=$(RUNNING_VERSION_CODE) -D__TARGET_ARCH_$(ARCH) $(CLANG_BPF_SYS_INCLUDES) -c $(filter %.c,$^) -o $@
+	$(CLANG) -fno-stack-protector $(INCLUDES) -ggdb -O2 -target bpf -DMY_LINUX_VERSION_CODE=$(RUNNING_VERSION_CODE) -D__TARGET_ARCH_$(ARCH) -D__BPF_FEATURE_ADDR_SPACE_CAST $(CLANG_BPF_SYS_INCLUDES) -MMD -MP -MF $(@:.o=.d) -MT $@ -c $< -o $@
 	$(LLVM_STRIP) -g $@ # strip useless DWARF info
 
 %.skel.h: %.bpf.o
@@ -89,7 +113,7 @@ dns: dns.o $(DNS_HELPER_OBJ)
 $(DNS_HELPER_OBJ): ../kernel-collector/tests/tester_dns.c libbpf
 	$(CC) $(CFLAGS) -DMY_LINUX_VERSION_CODE=$(RUNNING_VERSION_CODE) $(INCLUDES) -c $< -o $@
 
-compress: $(APPS) $(RINGBUF_SKELS)
+compress: $(APPS) $(RINGBUF_SKELS) $(ARENA_SKELS)
 
 aggregate/%.o: %.c %.skel.h
 	mkdir -p aggregate
@@ -101,10 +125,10 @@ $(LOADER_OBJ): netdata_core_loader.c netdata_core_loader.h
 $(AGGREGATE_LIB): $(AGGREGATE_APP_OBJECTS) $(DNS_HELPER_OBJ) $(LOADER_OBJ)
 	ar rcs $@ $^
 
-$(OUTPUT)$(AGGREGATE_TESTER): core_tester.c $(LOADER_OBJ) $(AGGREGATE_APP_OBJECTS) $(DNS_HELPER_OBJ) $(RINGBUF_SKELS)
+$(OUTPUT)$(AGGREGATE_TESTER): core_tester.c $(LOADER_OBJ) $(AGGREGATE_APP_OBJECTS) $(DNS_HELPER_OBJ) $(RINGBUF_SKELS) $(ARENA_SKELS)
 	$(CC) $(CFLAGS) -DMY_LINUX_VERSION_CODE=$(RUNNING_VERSION_CODE) $(INCLUDES) -L../.local_libbpf $< $(LOADER_OBJ) $(AGGREGATE_APP_OBJECTS) $(DNS_HELPER_OBJ) -lbpf -lelf -lz -o $@
 
-$(OUTPUT)$(AGGREGATE_TESTER_GO): $(AGGREGATE_LIB) $(RINGBUF_SKELS) $(wildcard core_tester_go/*.go)
+$(OUTPUT)$(AGGREGATE_TESTER_GO): $(AGGREGATE_LIB) $(RINGBUF_SKELS) $(ARENA_SKELS) $(wildcard core_tester_go/*.go)
 	CGO_ENABLED=1 \
 	CGO_CFLAGS="$(CFLAGS) -DMY_LINUX_VERSION_CODE=$(RUNNING_VERSION_CODE) -I$(CURDIR) -I$(CURDIR)/../.local_libbpf -I$(CURDIR)/../includes -I$(CURDIR)/../kernel-collector/includes -I$(CURDIR)/../libbpf/src -I$(CURDIR)/../libbpf/include/uapi" \
 	CGO_LDFLAGS="-L$(CURDIR)/aggregate -lnetdata_tests -L$(CURDIR)/../.local_libbpf -lbpf -lelf -lz" \
