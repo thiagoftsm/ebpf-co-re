@@ -24,6 +24,7 @@
 #include "dc_buffer.skel.h"
 #include "dns_buffer.skel.h"
 #include "fd_buffer.skel.h"
+#include "socket_buffer.skel.h"
 #include "oomkill_buffer.skel.h"
 #include "process_buffer.skel.h"
 #include "shm_buffer.skel.h"
@@ -37,6 +38,7 @@
 #include "netdata_dc_arena.h"
 #include "netdata_dns_arena.h"
 #include "netdata_fd_arena.h"
+#include "netdata_socket_arena.h"
 #include "netdata_oomkill_arena.h"
 #include "netdata_process_arena.h"
 #include "netdata_shm_arena.h"
@@ -47,6 +49,7 @@
 #include "dc_arena.skel.h"
 #include "dns_arena.skel.h"
 #include "fd_arena.skel.h"
+#include "socket_arena.skel.h"
 #include "oomkill_arena.skel.h"
 #include "process_arena.skel.h"
 #include "shm_arena.skel.h"
@@ -221,6 +224,7 @@ DEFINE_BUFFER_SKEL_OPS(cachestat_buffer)
 DEFINE_BUFFER_SKEL_OPS(dc_buffer)
 DEFINE_BUFFER_SKEL_OPS(dns_buffer)
 DEFINE_BUFFER_SKEL_OPS(fd_buffer)
+DEFINE_BUFFER_SKEL_OPS(socket_buffer)
 DEFINE_BUFFER_SKEL_OPS(oomkill_buffer)
 DEFINE_BUFFER_SKEL_OPS(process_buffer)
 DEFINE_BUFFER_SKEL_OPS(shm_buffer)
@@ -232,6 +236,7 @@ static const buffer_skel_ops_t buffer_skel_ops[] = {
     { "dc", open_dc_buffer, load_dc_buffer, destroy_dc_buffer },
     { "dns", open_dns_buffer, load_dns_buffer, destroy_dns_buffer },
     { "fd", open_fd_buffer, load_fd_buffer, destroy_fd_buffer },
+    { "socket", open_socket_buffer, load_socket_buffer, destroy_socket_buffer },
     { "oomkill", open_oomkill_buffer, load_oomkill_buffer, destroy_oomkill_buffer },
     { "process", open_process_buffer, load_process_buffer, destroy_process_buffer },
     { "shm", open_shm_buffer, load_shm_buffer, destroy_shm_buffer },
@@ -245,6 +250,7 @@ DEFINE_BUFFER_SKEL_OPS(cachestat_arena)
 DEFINE_BUFFER_SKEL_OPS(dc_arena)
 DEFINE_BUFFER_SKEL_OPS(dns_arena)
 DEFINE_BUFFER_SKEL_OPS(fd_arena)
+DEFINE_BUFFER_SKEL_OPS(socket_arena)
 DEFINE_BUFFER_SKEL_OPS(oomkill_arena)
 DEFINE_BUFFER_SKEL_OPS(process_arena)
 DEFINE_BUFFER_SKEL_OPS(shm_arena)
@@ -256,6 +262,7 @@ static const buffer_skel_ops_t arena_skel_ops[] = {
     { "dc", open_dc_arena, load_dc_arena, destroy_dc_arena },
     { "dns", open_dns_arena, load_dns_arena, destroy_dns_arena },
     { "fd", open_fd_arena, load_fd_arena, destroy_fd_arena },
+    { "socket", open_socket_arena, load_socket_arena, destroy_socket_arena },
     { "oomkill", open_oomkill_arena, load_oomkill_arena, destroy_oomkill_arena },
     { "process", open_process_arena, load_process_arena, destroy_process_arena },
     { "shm", open_shm_arena, load_shm_arena, destroy_shm_arena },
@@ -302,7 +309,7 @@ static const aggregate_test_case_t aggregate_tests[] = {
     { "shm", "shm", netdata_shm_entry, NULL, NULL, SELECT_SHM,
       MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, 1, "shm_ctrl" },
     { "socket", "socket", netdata_socket_entry, NULL, NULL, SELECT_SOCKET,
-      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1 },
+      MODE_PROBE | MODE_TRACEPOINT | MODE_TRAMPOLINE, 1, 1, 1, 1, "socket_ctrl" },
     { "softirq", "softirq", netdata_softirq_entry, NULL, NULL, SELECT_SOFTIRQ,
       MODE_NONE, 0, 0 },
     { "swap", "swap", netdata_swap_entry, NULL, NULL, SELECT_SWAP,

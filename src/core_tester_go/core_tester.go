@@ -24,6 +24,7 @@ static void netdata_disable_libbpf_memlock_rlim(void)
 #include "dc_buffer.skel.h"
 #include "dns_buffer.skel.h"
 #include "fd_buffer.skel.h"
+#include "socket_buffer.skel.h"
 #include "oomkill_buffer.skel.h"
 #include "process_buffer.skel.h"
 #include "shm_buffer.skel.h"
@@ -80,6 +81,7 @@ DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(cachestat_buffer)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(dc_buffer)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(dns_buffer)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(fd_buffer)
+DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(socket_buffer)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(oomkill_buffer)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(process_buffer)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(shm_buffer)
@@ -91,6 +93,7 @@ static const struct netdata_core_buffer_skel_ops netdata_core_buffer_skel_ops[] 
 	{ "dc", netdata_core_open_dc_buffer, netdata_core_load_dc_buffer, netdata_core_destroy_dc_buffer },
 	{ "dns", netdata_core_open_dns_buffer, netdata_core_load_dns_buffer, netdata_core_destroy_dns_buffer },
 	{ "fd", netdata_core_open_fd_buffer, netdata_core_load_fd_buffer, netdata_core_destroy_fd_buffer },
+	{ "socket", netdata_core_open_socket_buffer, netdata_core_load_socket_buffer, netdata_core_destroy_socket_buffer },
 	{ "oomkill", netdata_core_open_oomkill_buffer, netdata_core_load_oomkill_buffer, netdata_core_destroy_oomkill_buffer },
 	{ "process", netdata_core_open_process_buffer, netdata_core_load_process_buffer, netdata_core_destroy_process_buffer },
 	{ "shm", netdata_core_open_shm_buffer, netdata_core_load_shm_buffer, netdata_core_destroy_shm_buffer },
@@ -116,6 +119,7 @@ static const struct netdata_core_buffer_skel_ops *netdata_core_find_buffer_skel_
 #include "netdata_dc_arena.h"
 #include "netdata_dns_arena.h"
 #include "netdata_fd_arena.h"
+#include "netdata_socket_arena.h"
 #include "netdata_oomkill_arena.h"
 #include "netdata_process_arena.h"
 #include "netdata_shm_arena.h"
@@ -126,6 +130,7 @@ static const struct netdata_core_buffer_skel_ops *netdata_core_find_buffer_skel_
 #include "dc_arena.skel.h"
 #include "dns_arena.skel.h"
 #include "fd_arena.skel.h"
+#include "socket_arena.skel.h"
 #include "oomkill_arena.skel.h"
 #include "process_arena.skel.h"
 #include "shm_arena.skel.h"
@@ -154,6 +159,7 @@ DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(cachestat_arena)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(dc_arena)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(dns_arena)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(fd_arena)
+DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(socket_arena)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(oomkill_arena)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(process_arena)
 DEFINE_NETDATA_CORE_BUFFER_SKEL_OPS(shm_arena)
@@ -165,6 +171,7 @@ static const struct netdata_core_buffer_skel_ops netdata_core_arena_skel_ops[] =
 	{ "dc", netdata_core_open_dc_arena, netdata_core_load_dc_arena, netdata_core_destroy_dc_arena },
 	{ "dns", netdata_core_open_dns_arena, netdata_core_load_dns_arena, netdata_core_destroy_dns_arena },
 	{ "fd", netdata_core_open_fd_arena, netdata_core_load_fd_arena, netdata_core_destroy_fd_arena },
+	{ "socket", netdata_core_open_socket_arena, netdata_core_load_socket_arena, netdata_core_destroy_socket_arena },
 	{ "oomkill", netdata_core_open_oomkill_arena, netdata_core_load_oomkill_arena, netdata_core_destroy_oomkill_arena },
 	{ "process", netdata_core_open_process_arena, netdata_core_load_process_arena, netdata_core_destroy_process_arena },
 	{ "shm", netdata_core_open_shm_arena, netdata_core_load_shm_arena, netdata_core_destroy_shm_arena },
@@ -899,7 +906,7 @@ var aggregateTests = []aggregateTestCase{
 	{name: "oomkill", binary: "oomkill", selectionBit: selectOOMKill, bufferSupported: true, arenaSupported: true},
 	{name: "process", binary: "process", selectionBit: selectProcess, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, arenaSupported: true, bufferCtrl: "process_ctrl"},
 	{name: "shm", binary: "shm", selectionBit: selectSHM, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, arenaSupported: true, bufferCtrl: "shm_ctrl"},
-	{name: "socket", binary: "socket", selectionBit: selectSocket, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true},
+	{name: "socket", binary: "socket", selectionBit: selectSocket, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, arenaSupported: true, bufferCtrl: "socket_ctrl"},
 	{name: "softirq", binary: "softirq", selectionBit: selectSoftirq},
 	{name: "swap", binary: "swap", selectionBit: selectSwap, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true, pidSupported: true, bufferSupported: true, arenaSupported: true, bufferCtrl: "swap_ctrl"},
 	{name: "sync", binary: "sync", selectionBit: selectSync, modes: modeProbe | modeTracepoint | modeTrampoline, emitModeArg: true},

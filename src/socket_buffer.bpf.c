@@ -1,0 +1,619 @@
+#include "vmlinux_508.h"
+#include "bpf_tracing.h"
+#include "bpf_endian.h"
+#include "bpf_helpers.h"
+#include "bpf_core_read.h"
+
+#ifndef KERNEL_VERSION
+#define KERNEL_VERSION(a, b, c) (((a) << 16) + ((b) << 8) + (c))
+#endif
+
+#ifndef LINUX_VERSION_CODE
+#define LINUX_VERSION_CODE MY_LINUX_VERSION_CODE
+#endif
+
+#include "netdata_core.h"
+#include "netdata_arena_common.h"
+#include "netdata_socket.h"
+#include "netdata_socket_buffer.h"
+
+#define AF_UNSPEC	0
+#define AF_INET		2
+#define AF_INET6	10
+
+#ifdef NETDATA_ARENA_MODE
+#define NETDATA_ARENA_PTR __arena
+#else
+#define NETDATA_ARENA_PTR
+#endif
+
+/************************************************************************************
+ *
+ *                              Maps
+ *
+ ***********************************************************************************/
+
+NETDATA_BPF_RINGBUF_DEF(socket_events, NETDATA_SOCKET_RINGBUF_SIZE);
+NETDATA_BPF_PERCPU_ARRAY_DEF(tbl_global_sock, __u32, __u64, NETDATA_SOCKET_COUNTER);
+NETDATA_BPF_PERCPU_HASH_DEF(tbl_nv_udp, __u64, void *, 4096);
+NETDATA_BPF_HASH_DEF(tbl_lports, netdata_passive_connection_idx_t, netdata_passive_connection_t, 1024);
+NETDATA_BPF_ARRAY_DEF(socket_ctrl, __u32, __u64, NETDATA_CONTROLLER_END);
+
+/************************************************************************************
+ *
+ *                              Common helpers
+ *
+ ***********************************************************************************/
+
+static __always_inline __u16 set_idx_value(netdata_socket_idx_t *nsi, struct inet_sock *is)
+{
+    __u16 family = 0;
+
+    BPF_CORE_READ_INTO(&family, is, sk.__sk_common.skc_family);
+    if (family == AF_INET) {
+        BPF_CORE_READ_INTO(&nsi->saddr.addr32[0], is, inet_saddr);
+        BPF_CORE_READ_INTO(&nsi->daddr.addr32[0], is, sk.__sk_common.skc_daddr);
+
+        if ((nsi->saddr.addr32[0] == 16777343 || nsi->daddr.addr32[0] == 16777343) ||
+            (nsi->saddr.addr32[0] == 0 || nsi->daddr.addr32[0] == 0))
+            return AF_UNSPEC;
+    } else if (family == AF_INET6) {
+#if defined(NETDATA_CONFIG_IPV6)
+        BPF_CORE_READ_INTO(&nsi->saddr.addr8, is, sk.__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
+        BPF_CORE_READ_INTO(&nsi->daddr.addr8, is, sk.__sk_common.skc_v6_daddr.in6_u.u6_addr8);
+
+        if (((nsi->saddr.addr64[0] == 0) && (nsi->saddr.addr64[1] == 72057594037927936)) ||
+            ((nsi->daddr.addr64[0] == 0) && (nsi->daddr.addr64[1] == 72057594037927936)))
+            return AF_UNSPEC;
+
+        if (((nsi->saddr.addr64[0] == 0) && (nsi->saddr.addr64[1] == 0)) ||
+            ((nsi->daddr.addr64[0] == 0) && (nsi->daddr.addr64[1] == 0)))
+            return AF_UNSPEC;
+#endif
+    } else {
+        return AF_UNSPEC;
+    }
+
+    BPF_CORE_READ_INTO(&nsi->dport, is, sk.__sk_common.skc_dport);
+    if (nsi->dport == 0)
+        return AF_UNSPEC;
+
+    __u32 tgid = 0;
+    nsi->pid = netdata_get_pid(&socket_ctrl, &tgid);
+
+    return family;
+}
+
+static __always_inline void update_socket_stats(netdata_socket_t NETDATA_ARENA_PTR *ptr,
+                                                __u64 sent,
+                                                __u64 received,
+                                                __u32 retransmitted,
+                                                __u16 protocol)
+{
+    ptr->ct = bpf_ktime_get_ns();
+
+    if (sent) {
+        if (protocol == IPPROTO_TCP) {
+            ptr->tcp.call_tcp_sent += 1;
+            ptr->tcp.tcp_bytes_sent += sent;
+            ptr->tcp.retransmit += retransmitted;
+        } else {
+            ptr->udp.call_udp_sent += 1;
+            ptr->udp.udp_bytes_sent += sent;
+        }
+    }
+
+    if (received) {
+        if (protocol == IPPROTO_TCP) {
+            ptr->tcp.call_tcp_received += 1;
+            ptr->tcp.tcp_bytes_received += received;
+        } else {
+            ptr->udp.call_udp_received += 1;
+            ptr->udp.udp_bytes_received += received;
+        }
+    }
+}
+
+static __always_inline void update_socket_common(netdata_socket_t NETDATA_ARENA_PTR *data, __u16 protocol, __u16 family)
+{
+    char comm[TASK_COMM_LEN];
+
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(4,11,0))
+    bpf_get_current_comm(comm, TASK_COMM_LEN);
+#pragma unroll
+    for (int i = 0; i < TASK_COMM_LEN; i++)
+        data->name[i] = comm[i];
+#else
+    data->name[0] = '\0';
+#endif
+
+    data->first = bpf_ktime_get_ns();
+    data->protocol = protocol;
+    data->family = family;
+}
+
+static __always_inline struct netdata_socket_event_t NETDATA_ARENA_PTR *
+socket_event_reserve(struct inet_sock *is, __u16 *family, netdata_socket_idx_t *idx, __u16 protocol)
+{
+    struct netdata_socket_event_t NETDATA_ARENA_PTR *ev;
+
+    if (!is)
+        return NULL;
+
+    *family = set_idx_value(idx, is);
+    if (*family == AF_UNSPEC)
+        return NULL;
+
+    ev = bpf_ringbuf_reserve(&socket_events, sizeof(*ev), 0);
+    if (!ev)
+        return NULL;
+
+    __builtin_memset(ev, 0, sizeof(*ev));
+    ev->idx = *idx;
+    update_socket_common(&ev->data, protocol, *family);
+
+    return ev;
+}
+
+static __always_inline void emit_socket_event(struct inet_sock *is,
+                                              __u64 sent,
+                                              __u64 received,
+                                              __u32 retransmitted,
+                                              __u16 protocol,
+                                              __u32 state)
+{
+    netdata_socket_idx_t idx = { };
+    __u16 family;
+    struct netdata_socket_event_t NETDATA_ARENA_PTR *ev = socket_event_reserve(is, &family, &idx, protocol);
+
+    if (!ev)
+        return;
+
+    ev->data.tcp.state = state;
+    update_socket_stats(&ev->data, sent, received, retransmitted, protocol);
+    bpf_ringbuf_submit(ev, 0);
+}
+
+static __always_inline void emit_socket_close_event(struct inet_sock *is)
+{
+    netdata_socket_idx_t idx = { };
+    __u16 family;
+    struct netdata_socket_event_t NETDATA_ARENA_PTR *ev = socket_event_reserve(is, &family, &idx, IPPROTO_TCP);
+
+    if (!ev)
+        return;
+
+    ev->data.tcp.close = 1;
+    bpf_ringbuf_submit(ev, 0);
+}
+
+static __always_inline void emit_socket_connect_event(struct inet_sock *is)
+{
+    netdata_socket_idx_t idx = { };
+    __u16 family;
+    struct netdata_socket_event_t NETDATA_ARENA_PTR *ev = socket_event_reserve(is, &family, &idx, IPPROTO_TCP);
+
+    if (!ev)
+        return;
+
+    if (family == AF_INET)
+        ev->data.tcp.ipv4_connect = 1;
+    else
+        ev->data.tcp.ipv6_connect = 1;
+
+    bpf_ringbuf_submit(ev, 0);
+}
+
+static __always_inline void emit_socket_external_origin_event(struct sock *sk, __u16 protocol)
+{
+    __u16 family;
+    netdata_socket_idx_t nv_idx = { };
+    struct netdata_socket_event_t NETDATA_ARENA_PTR *ev;
+    struct inet_sock *is = (struct inet_sock *)sk;
+
+    if (!is)
+        return;
+
+    family = set_idx_value(&nv_idx, is);
+    if (family == AF_UNSPEC)
+        return;
+
+    ev = bpf_ringbuf_reserve(&socket_events, sizeof(*ev), 0);
+    if (!ev)
+        return;
+
+    __builtin_memset(ev, 0, sizeof(*ev));
+    ev->idx = nv_idx;
+    update_socket_common(&ev->data, protocol, family);
+    ev->data.external_origin = 1;
+    bpf_ringbuf_submit(ev, 0);
+}
+
+static __always_inline int netdata_common_inet_csk_accept(struct sock *sk)
+{
+    if (!sk)
+        return 0;
+
+    __u16 protocol = BPF_CORE_READ(sk, sk_protocol);
+    if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP)
+        return 0;
+
+    netdata_passive_connection_idx_t idx = { };
+    idx.protocol = protocol;
+    idx.port = BPF_CORE_READ(sk, __sk_common.skc_num);
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 tgid = (__u32)(pid_tgid >> 32);
+    __u32 pid = (__u32)pid_tgid;
+
+    netdata_passive_connection_t *value = (netdata_passive_connection_t *)bpf_map_lookup_elem(&tbl_lports, &idx);
+    if (value) {
+        value->tgid = tgid;
+        value->pid = pid;
+        libnetdata_update_u64(&value->counter, 1);
+    } else {
+        netdata_passive_connection_t data = { };
+        data.tgid = tgid;
+        data.pid = pid;
+        data.counter = 1;
+        bpf_map_update_elem(&tbl_lports, &idx, &data, BPF_ANY);
+    }
+
+    emit_socket_external_origin_event(sk, protocol);
+    return 0;
+}
+
+static __always_inline int netdata_common_tcp_retransmit(struct inet_sock *is)
+{
+    libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_TCP_RETRANSMIT, 1);
+    emit_socket_event(is, 0, 0, 1, IPPROTO_TCP, 0);
+    return 0;
+}
+
+static __always_inline int netdata_common_tcp_cleanup_rbuf(int copied, struct inet_sock *is, __u64 received)
+{
+    libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_CALLS_TCP_CLEANUP_RBUF, 1);
+
+    if (copied < 0) {
+        libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_ERROR_TCP_CLEANUP_RBUF, 1);
+        return 0;
+    }
+
+    emit_socket_event(is, 0, (__u64)copied, 1, IPPROTO_TCP, 0);
+    libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_BYTES_TCP_CLEANUP_RBUF, received);
+    return 0;
+}
+
+static __always_inline int netdata_common_tcp_set_state(struct inet_sock *is, int state)
+{
+    libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_CALLS_TCP_SET_STATE, 1);
+    emit_socket_event(is, 0, 0, 0, IPPROTO_TCP, state);
+    return 0;
+}
+
+static __always_inline int netdata_common_tcp_close(struct inet_sock *is)
+{
+    libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_CALLS_TCP_CLOSE, 1);
+
+    if (!is)
+        return 0;
+
+    emit_socket_close_event(is);
+    return 0;
+}
+
+static __always_inline int netdata_common_udp_recvmsg(struct sock *sk)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_CALLS_UDP_RECVMSG, 1);
+    bpf_map_update_elem(&tbl_nv_udp, &pid_tgid, &sk, BPF_ANY);
+    return 0;
+}
+
+static __always_inline int netdata_common_udp_recvmsg_return(struct inet_sock *is, __u64 received)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct sock **skpp = bpf_map_lookup_elem(&tbl_nv_udp, &pid_tgid);
+
+    if (skpp == 0)
+        return 0;
+
+    bpf_map_delete_elem(&tbl_nv_udp, &pid_tgid);
+
+    libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_BYTES_UDP_RECVMSG, received);
+    emit_socket_event(is, 0, received, 0, IPPROTO_UDP, 0);
+    return 0;
+}
+
+static __always_inline int netdata_common_tcp_connect(struct inet_sock *is, int ret,
+                                                      enum socket_counters success,
+                                                      enum socket_counters err)
+{
+    libnetdata_update_global(&tbl_global_sock, success, 1);
+
+    if (ret < 0) {
+        libnetdata_update_global(&tbl_global_sock, err, 1);
+        return 0;
+    }
+
+    emit_socket_connect_event(is);
+    return 0;
+}
+
+static __always_inline int netdata_common_tcp_send_message(struct inet_sock *is, size_t sent, int ret)
+{
+    libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_CALLS_TCP_SENDMSG, 1);
+
+    if (ret < 0) {
+        libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_ERROR_TCP_SENDMSG, 1);
+        return 0;
+    }
+
+    emit_socket_event(is, sent, 0, 0, IPPROTO_TCP, 0);
+    libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_BYTES_TCP_SENDMSG, sent);
+    return 0;
+}
+
+static __always_inline int netdata_common_udp_send_message(struct inet_sock *is, size_t sent, int ret)
+{
+    libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_CALLS_UDP_SENDMSG, 1);
+
+    if (ret < 0) {
+        libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_ERROR_UDP_SENDMSG, 1);
+        return 0;
+    }
+
+    emit_socket_event(is, sent, 0, 0, IPPROTO_UDP, 0);
+    libnetdata_update_global(&tbl_global_sock, NETDATA_KEY_BYTES_UDP_SENDMSG, (__u64)sent);
+    return 0;
+}
+
+/***********************************************************************************
+ *
+ *                             SOCKET SECTION(kprobe)
+ *
+ ***********************************************************************************/
+
+SEC("kretprobe/inet_csk_accept")
+int BPF_KRETPROBE(netdata_inet_csk_accept_kretprobe)
+{
+    struct sock *sk = (struct sock *)PT_REGS_RC(ctx);
+    return netdata_common_inet_csk_accept(sk);
+}
+
+SEC("kprobe/tcp_v4_connect")
+int BPF_KRETPROBE(netdata_tcp_v4_connect_kprobe)
+{
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    return netdata_common_tcp_connect(is, 0, NETDATA_KEY_CALLS_TCP_CONNECT_IPV4,
+                                      NETDATA_KEY_ERROR_TCP_CONNECT_IPV4);
+}
+
+SEC("kretprobe/tcp_v4_connect")
+int BPF_KRETPROBE(netdata_tcp_v4_connect_kretprobe)
+{
+    int ret = (int)PT_REGS_RC(ctx);
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    return netdata_common_tcp_connect(is, ret, NETDATA_KEY_CALLS_TCP_CONNECT_IPV4,
+                                      NETDATA_KEY_ERROR_TCP_CONNECT_IPV4);
+}
+
+SEC("kprobe/tcp_v6_connect")
+int BPF_KRETPROBE(netdata_tcp_v6_connect_kprobe)
+{
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    return netdata_common_tcp_connect(is, 0, NETDATA_KEY_CALLS_TCP_CONNECT_IPV6,
+                                      NETDATA_KEY_ERROR_TCP_CONNECT_IPV6);
+}
+
+SEC("kretprobe/tcp_v6_connect")
+int BPF_KRETPROBE(netdata_tcp_v6_connect_kretprobe)
+{
+    int ret = (int)PT_REGS_RC(ctx);
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    return netdata_common_tcp_connect(is, ret, NETDATA_KEY_CALLS_TCP_CONNECT_IPV6,
+                                      NETDATA_KEY_ERROR_TCP_CONNECT_IPV6);
+}
+
+SEC("kprobe/tcp_retransmit_skb")
+int BPF_KPROBE(netdata_tcp_retransmit_skb_kprobe)
+{
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    return netdata_common_tcp_retransmit(is);
+}
+
+SEC("kprobe/tcp_cleanup_rbuf")
+int BPF_KPROBE(netdata_tcp_cleanup_rbuf_kprobe)
+{
+    int copied = (int)PT_REGS_PARM2(ctx);
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    __u64 received = (__u64)copied;
+
+    return netdata_common_tcp_cleanup_rbuf(copied, is, received);
+}
+
+SEC("kprobe/tcp_set_state")
+int BPF_KPROBE(netdata_tcp_set_state_kprobe)
+{
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    int state = (int)PT_REGS_PARM2(ctx);
+
+    return netdata_common_tcp_set_state(is, state);
+}
+
+SEC("kprobe/tcp_close")
+int BPF_KPROBE(netdata_tcp_close_kprobe)
+{
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    return netdata_common_tcp_close(is);
+}
+
+SEC("kprobe/udp_recvmsg")
+int BPF_KPROBE(netdata_udp_recvmsg_kprobe)
+{
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+    return netdata_common_udp_recvmsg(sk);
+}
+
+SEC("kretprobe/udp_recvmsg")
+int BPF_KRETPROBE(netdata_udp_recvmsg_kretprobe)
+{
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    __u64 received = (__u64)PT_REGS_RC(ctx);
+    return netdata_common_udp_recvmsg_return(is, received);
+}
+
+SEC("kretprobe/tcp_sendmsg")
+int BPF_KRETPROBE(netdata_tcp_sendmsg_kretprobe)
+{
+    int ret = (int)PT_REGS_RC(ctx);
+    size_t sent = (ret > 0) ? (size_t)ret : 0;
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    return netdata_common_tcp_send_message(is, sent, ret);
+}
+
+SEC("kprobe/tcp_sendmsg")
+int BPF_KPROBE(netdata_tcp_sendmsg_kprobe)
+{
+    size_t sent = (size_t)PT_REGS_PARM3(ctx);
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    return netdata_common_tcp_send_message(is, sent, 0);
+}
+
+SEC("kretprobe/udp_sendmsg")
+int BPF_KRETPROBE(netdata_udp_sendmsg_kretprobe)
+{
+    int ret = (int)PT_REGS_RC(ctx);
+    size_t sent = (ret > 0) ? (size_t)ret : 0;
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    return netdata_common_udp_send_message(is, sent, ret);
+}
+
+SEC("kprobe/udp_sendmsg")
+int BPF_KPROBE(netdata_udp_sendmsg_kprobe)
+{
+    size_t sent = (size_t)PT_REGS_PARM3(ctx);
+    struct inet_sock *is = (struct inet_sock *)((struct sock *)PT_REGS_PARM1(ctx));
+    return netdata_common_udp_send_message(is, sent, 0);
+}
+
+/***********************************************************************************
+ *
+ *                             SOCKET SECTION(tracepoint)
+ *
+ ***********************************************************************************/
+
+SEC("fexit/inet_csk_accept")
+int BPF_PROG(netdata_inet_csk_accept_fexit, struct sock *sk)
+{
+    return netdata_common_inet_csk_accept(sk);
+}
+
+SEC("fentry/tcp_v4_connect")
+int BPF_PROG(netdata_tcp_v4_connect_fentry, struct sock *sk, struct sockaddr *uaddr, int addr_len, int ret)
+{
+    (void)uaddr;
+    (void)addr_len;
+    (void)ret;
+    return netdata_common_tcp_connect((struct inet_sock *)sk, 0, NETDATA_KEY_CALLS_TCP_CONNECT_IPV4,
+                                      NETDATA_KEY_ERROR_TCP_CONNECT_IPV4);
+}
+
+SEC("fexit/tcp_v4_connect")
+int BPF_PROG(netdata_tcp_v4_connect_fexit, struct sock *sk, struct sockaddr *uaddr, int addr_len, int ret)
+{
+    (void)uaddr;
+    (void)addr_len;
+    return netdata_common_tcp_connect((struct inet_sock *)sk, ret, NETDATA_KEY_CALLS_TCP_CONNECT_IPV4,
+                                      NETDATA_KEY_ERROR_TCP_CONNECT_IPV4);
+}
+
+SEC("fentry/tcp_v6_connect")
+int BPF_PROG(netdata_tcp_v6_connect_fentry, struct sock *sk, struct sockaddr *uaddr, int addr_len, int ret)
+{
+    (void)uaddr;
+    (void)addr_len;
+    (void)ret;
+    return netdata_common_tcp_connect((struct inet_sock *)sk, 0, NETDATA_KEY_CALLS_TCP_CONNECT_IPV6,
+                                      NETDATA_KEY_ERROR_TCP_CONNECT_IPV6);
+}
+
+SEC("fexit/tcp_v6_connect")
+int BPF_PROG(netdata_tcp_v6_connect_fexit, struct sock *sk, struct sockaddr *uaddr, int addr_len, int ret)
+{
+    (void)uaddr;
+    (void)addr_len;
+    return netdata_common_tcp_connect((struct inet_sock *)sk, ret, NETDATA_KEY_CALLS_TCP_CONNECT_IPV6,
+                                      NETDATA_KEY_ERROR_TCP_CONNECT_IPV6);
+}
+
+SEC("fentry/tcp_retransmit_skb")
+int BPF_PROG(netdata_tcp_retransmit_skb_fentry, struct sock *sk)
+{
+    return netdata_common_tcp_retransmit((struct inet_sock *)sk);
+}
+
+SEC("fentry/tcp_cleanup_rbuf")
+int BPF_PROG(netdata_tcp_cleanup_rbuf_fentry, struct sock *sk, int copied)
+{
+    return netdata_common_tcp_cleanup_rbuf(copied, (struct inet_sock *)sk, (__u64)copied);
+}
+
+SEC("fentry/tcp_set_state")
+int BPF_PROG(netdata_tcp_set_state_fentry, struct sock *sk, int state)
+{
+    return netdata_common_tcp_set_state((struct inet_sock *)sk, state);
+}
+
+SEC("fentry/tcp_close")
+int BPF_PROG(netdata_tcp_close_fentry, struct sock *sk)
+{
+    return netdata_common_tcp_close((struct inet_sock *)sk);
+}
+
+SEC("fentry/udp_recvmsg")
+int BPF_PROG(netdata_udp_recvmsg_fentry, struct sock *sk, struct msghdr *msg)
+{
+    (void)msg;
+    return netdata_common_udp_recvmsg(sk);
+}
+
+SEC("fexit/udp_recvmsg")
+int BPF_PROG(netdata_udp_recvmsg_fexit, struct sock *sk, struct msghdr *msg, int ret)
+{
+    (void)msg;
+    return netdata_common_udp_recvmsg_return((struct inet_sock *)sk, (__u64)ret);
+}
+
+SEC("fentry/tcp_sendmsg")
+int BPF_PROG(netdata_tcp_sendmsg_fentry, struct sock *sk, struct msghdr *msg, size_t size)
+{
+    (void)msg;
+    return netdata_common_tcp_send_message((struct inet_sock *)sk, size, 0);
+}
+
+SEC("fexit/tcp_sendmsg")
+int BPF_PROG(netdata_tcp_sendmsg_fexit, struct sock *sk, struct msghdr *msg, size_t size, int ret)
+{
+    (void)msg;
+    size_t sent = (ret > 0) ? (size_t)ret : 0;
+    return netdata_common_tcp_send_message((struct inet_sock *)sk, sent, ret);
+}
+
+SEC("fentry/udp_sendmsg")
+int BPF_PROG(netdata_udp_sendmsg_fentry, struct sock *sk, struct msghdr *msg, size_t len)
+{
+    (void)msg;
+    return netdata_common_udp_send_message((struct inet_sock *)sk, len, 0);
+}
+
+SEC("fexit/udp_sendmsg")
+int BPF_PROG(netdata_udp_sendmsg_fexit, struct sock *sk, struct msghdr *msg, size_t len, int ret)
+{
+    (void)msg;
+    size_t sent = (ret > 0) ? (size_t)ret : 0;
+    return netdata_common_udp_send_message((struct inet_sock *)sk, sent, ret);
+}
+
+char _license[] SEC("license") = "GPL";
