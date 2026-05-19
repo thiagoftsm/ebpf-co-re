@@ -11,8 +11,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 # hadolint ignore=DL3018,DL3015,DL3008,DL3009
 RUN apt-get update && \
     apt-get install -y build-essential autoconf automake coreutils pkg-config \
-                       bc libelf-dev libssl-dev clang-tools-16 libclang-16-dev \
-                       llvm-16 rsync bison flex tar xz-utils wget libbfd-dev \
+                       bc libelf-dev libssl-dev clang-tools-22 libclang-22-dev \
+                       llvm-22 rsync bison flex tar xz-utils wget libbfd-dev \
                        golang-go \
                        libcap-dev
 
